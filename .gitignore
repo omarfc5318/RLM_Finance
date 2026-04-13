@@ -1,5 +1,9 @@
 .env
 data/raw/
+data/processed/
 __pycache__/
 *.joblib
+*.parquet
 .DS_Store
+logs/
+reports/

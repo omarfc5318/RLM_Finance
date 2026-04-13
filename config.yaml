@@ -21,4 +21,46 @@ splits:
 paths:
   raw: data/raw/
   processed: data/processed/
+  splits: data/splits/
+  models: models/
   logs: logs/
+  reports: reports/
+
+models:
+  xgboost:
+    n_estimators: 500
+    max_depth: 4
+    learning_rate: 0.05
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 10
+    gamma: 0.1
+  hmm:
+    n_states: 3
+    covariance_type: full
+    n_iter: 1000
+    tol: 1.0e-4
+
+features:
+  rolling_windows: [5, 21, 63]
+  return_windows: [1, 5, 21]
+  volatility_windows: [21, 63]
+  momentum_windows: [21, 63, 126]
+  zscore_window: 63
+
+backtest:
+  rebalance_freq: monthly
+  transaction_cost: 0.0005
+  max_position_size: 0.20
+  min_position_size: 0.0
+  slippage: 0.0001
+  initial_capital: 1_000_000
+
+risk:
+  max_portfolio_volatility: 0.15
+  max_drawdown_limit: 0.20
+  min_sharpe_threshold: 0.5
+  max_sector_concentration: 0.40
+  max_leverage: 1.0
+  var_confidence: 0.95
+  cvar_confidence: 0.95
