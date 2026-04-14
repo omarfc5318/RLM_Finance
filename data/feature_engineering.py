@@ -345,6 +345,179 @@ class PriceFeatureBuilder:
 
 
 # ---------------------------------------------------------------------------
+# Macro feature builder
+# ---------------------------------------------------------------------------
+class MacroFeatureBuilder:
+    """
+    Builds macro-derived features from the aligned macro DataFrame produced
+    by ingest_macro.py.
+
+    All features are point-in-time safe: every method shifts its input by 1
+    before computing any transformation, so feature[t] uses only macro values
+    known at the close of day t-1.
+    """
+
+    def __init__(self, config: dict) -> None:
+        self._processed_dir = PROJECT_ROOT / config["paths"]["processed"]
+
+    # ------------------------------------------------------------------
+    # Rate changes
+    # ------------------------------------------------------------------
+    def rate_changes(
+        self, df_macro: pd.DataFrame, windows: List[int] | None = None
+    ) -> pd.DataFrame:
+        """
+        N-day change in DFF and GS10 rates.
+
+        ANTI-LOOKAHEAD: rates are shifted by 1 before differencing so that
+        change[t] = rate[t-1] - rate[t-1-w], fully known before t opens.
+
+        Column naming: dff_change_{w}d, gs10_change_{w}d
+        """
+        if windows is None:
+            windows = [1, 5, 21]
+
+        shifted = df_macro[["DFF", "GS10"]].shift(1)
+        parts = []
+        for w in windows:
+            diff = shifted.diff(w)
+            diff.columns = [f"dff_change_{w}d", f"gs10_change_{w}d"]
+            parts.append(diff)
+            logger.debug("rate_changes window={}: shape {}", w, diff.shape)
+
+        return pd.concat(parts, axis=1)
+
+    # ------------------------------------------------------------------
+    # Inflation surprise
+    # ------------------------------------------------------------------
+    def inflation_surprise(self, df_macro: pd.DataFrame) -> pd.DataFrame:
+        """
+        Approximate month-over-month CPI change as a 21-day percent change.
+
+        ANTI-LOOKAHEAD: CPIAUCSL already has a 1-month publication lag applied
+        during ingestion (ingest_macro.py shifts the index forward by one month).
+        Adding another shift(1) here would make inflation_surprise two periods
+        stale — the value at t would reflect CPI from t-2, not t-1.  No extra
+        shift is applied.
+
+        Column naming: cpi_surprise
+        """
+        surprise = df_macro["CPIAUCSL"].pct_change(21).rename("cpi_surprise")
+        logger.debug("inflation_surprise: shape {}", surprise.shape)
+        return surprise.to_frame()
+
+    # ------------------------------------------------------------------
+    # VIX regime category
+    # ------------------------------------------------------------------
+    def vix_regime(self, df_macro: pd.DataFrame) -> pd.DataFrame:
+        """
+        Categorical VIX regime: 'low' (<15), 'medium' (15–25), 'high' (>25).
+
+        ANTI-LOOKAHEAD: VIX is shifted by 1 so the regime at t reflects the
+        closing VIX level from day t-1.
+
+        Column naming: vix_regime
+        """
+        shifted_vix = df_macro["VIXCLS"].shift(1)
+        regime = pd.cut(
+            shifted_vix,
+            bins=[-np.inf, 15, 25, np.inf],
+            labels=["low", "medium", "high"],
+        ).rename("vix_regime")
+        logger.debug("vix_regime: {} categories", regime.nunique())
+        return regime.to_frame()
+
+    # ------------------------------------------------------------------
+    # VIX change
+    # ------------------------------------------------------------------
+    def vix_change(
+        self, df_macro: pd.DataFrame, windows: List[int] | None = None
+    ) -> pd.DataFrame:
+        """
+        N-day change in VIX level.
+
+        ANTI-LOOKAHEAD: VIX is shifted by 1 before differencing.
+
+        Column naming: vix_change_{w}d
+        """
+        if windows is None:
+            windows = [5, 21]
+
+        shifted_vix = df_macro["VIXCLS"].shift(1)
+        parts = []
+        for w in windows:
+            chg = shifted_vix.diff(w).rename(f"vix_change_{w}d")
+            parts.append(chg)
+            logger.debug("vix_change window={}: shape {}", w, chg.shape)
+
+        return pd.concat(parts, axis=1)
+
+    # ------------------------------------------------------------------
+    # Yield curve slope
+    # ------------------------------------------------------------------
+    def yield_curve_slope(self, df_macro: pd.DataFrame) -> pd.DataFrame:
+        """
+        Yield curve slope (rate_spread) and its 21-day rolling mean.
+
+        ANTI-LOOKAHEAD: rate_spread is shifted by 1; the rolling mean is
+        applied to the already-shifted series.
+
+        Column naming: yield_curve_slope, yield_curve_slope_21d_ma
+        """
+        shifted_spread = df_macro["rate_spread"].shift(1)
+        slope = shifted_spread.rename("yield_curve_slope")
+        slope_ma = shifted_spread.rolling(21).mean().rename("yield_curve_slope_21d_ma")
+        result = pd.concat([slope, slope_ma], axis=1)
+        logger.debug("yield_curve_slope: shape {}", result.shape)
+        return result
+
+    # ------------------------------------------------------------------
+    # Build all macro features
+    # ------------------------------------------------------------------
+    def build_all(self, df_macro: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute every macro feature family, concatenate, and persist.
+
+        Parameters
+        ----------
+        df_macro : pd.DataFrame
+            Aligned macro DataFrame from ingest_macro.py.
+
+        Returns
+        -------
+        pd.DataFrame
+            Combined macro feature DataFrame saved to
+            data/processed/macro_features.parquet.
+        """
+        logger.info("Building macro features — input shape {}", df_macro.shape)
+
+        blocks = [
+            self.rate_changes(df_macro),
+            self.inflation_surprise(df_macro),
+            self.vix_regime(df_macro),
+            self.vix_change(df_macro),
+            self.yield_curve_slope(df_macro),
+        ]
+
+        combined = pd.concat(blocks, axis=1)
+        logger.info("Combined macro feature matrix: shape {}", combined.shape)
+
+        self._processed_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self._processed_dir / "macro_features.parquet"
+        # vix_regime is categorical — store as string so parquet round-trips cleanly
+        combined["vix_regime"] = combined["vix_regime"].astype(str)
+        combined.to_parquet(out_path)
+        logger.info(
+            "Saved → {} ({} rows, {} features)",
+            out_path.relative_to(PROJECT_ROOT),
+            len(combined),
+            combined.shape[1],
+        )
+
+        return combined
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
