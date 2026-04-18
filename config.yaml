@@ -28,13 +28,13 @@ paths:
 
 models:
   xgboost:
-    n_estimators: 500
-    max_depth: 4
-    learning_rate: 0.05
+    n_estimators: 1000
+    max_depth: 3
+    learning_rate: 0.01
     subsample: 0.8
-    colsample_bytree: 0.8
-    min_child_weight: 10
-    gamma: 0.1
+    colsample_bytree: 0.6
+    min_child_weight: 5
+    gamma: 0.0
   hmm:
     n_states: 3
     covariance_type: full
