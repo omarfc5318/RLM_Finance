@@ -64,3 +64,9 @@ risk:
   max_leverage: 1.0
   var_confidence: 0.95
   cvar_confidence: 0.95
+
+meta:
+  learner_version: v2  # v1 = models/meta/meta_learner.joblib (legacy)
+                       # v2 = models/meta/meta_learner_v2.joblib
+                       #      (H3 fix: wider alpha grid + StandardScaler +
+                       #       saturation bypass)

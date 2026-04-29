@@ -55,6 +55,15 @@ class WeightTracker:
         }])
         row.to_csv(self.path, mode="a", header=self._header_needed(), index=False)
 
+    def clear(self) -> None:
+        """
+        Truncate the audit CSV to an empty file with just the header row.
+        Call at the start of each FeedbackLoopEngine.run() so the audit
+        trail reflects only the current simulation and does not accumulate
+        rows from prior runs.
+        """
+        pd.DataFrame(columns=self.columns).to_csv(self.path, index=False)
+
     def log_weights_batch(self, weights_df: pd.DataFrame) -> None:
         """
         Overwrite the audit file with a complete batch of weights.

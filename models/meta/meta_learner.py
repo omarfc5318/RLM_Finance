@@ -31,6 +31,7 @@ from loguru import logger
 from scipy.special import softmax
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -87,9 +88,12 @@ class MetaLearner:
         self.weight_floor  = weight_floor
         self.n_models      = n_models
         self.future_window = future_window
-        self.models: Optional[List[RidgeCV]] = None
-        self.model_names   = ["return", "vol", "regime", "drawdown"]
-        self.feature_cols: Optional[List[str]] = None
+        self.models: Optional[List[RidgeCV]]        = None
+        self.model_names                             = ["return", "vol", "regime", "drawdown"]
+        self.feature_cols: Optional[List[str]]      = None
+        # H3 fix: scaler + saturation tracking (populated by train())
+        self._feature_scaler: Optional[StandardScaler] = None
+        self.saturated: dict                         = {}  # {model_name: bool}
 
     # ------------------------------------------------------------------
     # Proxy target construction
@@ -101,37 +105,47 @@ class MetaLearner:
         targets_df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        For each date t in meta_features_df.index, compute a 4-vector of
-        forward skill scores over [t+1, t+future_window].
+        Unified directional-PnL proxy target (Option 3 redesign).
 
-          score_return[t]   = Spearman(return_pred, SPY_tgt_ret_1d) over window
-          score_vol[t]      = -RMSE(vol_pred, SPY_tgt_vol_5d)
-          score_regime[t]   = Spearman IC between regime_directional and forward return
-                              regime mapping: 0→+1 (bull), 1→-1 (bear), 2→0 (neutral)
-                              Sideways days contribute 0 (not excluded) so Spearman
-                              can compute over the full 21d window. Requires > 1
-                              unique value in both series; else NaN.
-          score_drawdown[t] = -Brier(drawdown_risk_prob,
-                               (SPY_tgt_mdd_21d < -0.05))
-                              Works for single-class windows (2022 bear persistence).
+        Each base model carries an implicit directional signal d_i (in z-score
+        space, since ensemble_predictions are already normalized):
+          d_return[k]   = +return_pred[k]            (raw direction)
+          d_regime[k]   = -regime_pred[k]            (low z = bull → positive)
+          d_vol[k]      = -vol_pred[k]               (high vol = risk-off → negative)
+          d_drawdown[k] = -drawdown_risk_prob[k]     (high prob = risk-off → negative)
 
-        After scoring: drop rows with any NaN, then z-score each column.
+        For each date t in meta_features_df.index, the proxy score for model i is
+        the mean realized directional PnL of d_i over the forward window:
+
+          proxy_i[t] = mean_{k in [t+1, t+W]} d_i[k] * actual_return[k]
+
+        where actual_return[k] = SPY_tgt_ret_1d[k] (forward-stamped log return,
+        i.e. the return earned from holding d_i[k] over k → k+1).
+
+        After scoring: drop rows with any NaN, then z-score each column. All 4
+        models compete on the same metric → softmax weights pick the model with
+        the strongest realized directional contribution given the meta-features.
 
         NOTE: the forward window is the TRAINING TARGET — looking forward in y
         is standard supervised ML. The anti-lookahead contract applies to X.
         """
-        from scipy.stats import spearmanr
-
         ep  = ensemble_preds_df
         tgt = targets_df
 
-        ret_col = "SPY_tgt_ret_1d"  if "SPY_tgt_ret_1d"  in tgt.columns else None
-        vol_col = "SPY_tgt_vol_5d"  if "SPY_tgt_vol_5d"  in tgt.columns else None
-        mdd_col = "SPY_tgt_mdd_21d" if "SPY_tgt_mdd_21d" in tgt.columns else None
+        if "SPY_tgt_ret_1d" not in tgt.columns:
+            logger.warning("build_proxy_target: SPY_tgt_ret_1d not in targets")
+            return pd.DataFrame(columns=self.model_names)
 
-        ret_tgt = tgt[ret_col].reindex(ep.index) if ret_col else None
-        vol_tgt = tgt[vol_col].reindex(ep.index) if vol_col else None
-        mdd_tgt = tgt[mdd_col].reindex(ep.index) if mdd_col else None
+        ret_tgt = tgt["SPY_tgt_ret_1d"].reindex(ep.index)
+
+        # Per-model directional signals (same convention as evaluate_lift /
+        # engine.feedback.step — single source of truth)
+        signals = {
+            "return":   ep["return_pred"]        if "return_pred"        in ep else None,
+            "vol":      -ep["vol_pred"]          if "vol_pred"           in ep else None,
+            "regime":   -ep["regime_pred"]       if "regime_pred"        in ep else None,
+            "drawdown": -ep["drawdown_risk_prob"] if "drawdown_risk_prob" in ep else None,
+        }
 
         ep_pos   = {d: i for i, d in enumerate(ep.index)}
         min_obs  = max(5, self.future_window // 4)
@@ -146,91 +160,34 @@ class MetaLearner:
                 rows.append([np.nan] * 4)
                 continue
 
-            w = slice(pos + 1, pos + self.future_window + 1)
+            w  = slice(pos + 1, pos + self.future_window + 1)
+            rt = ret_tgt.iloc[w]
 
-            # return: Spearman IC
-            score_ret = np.nan
-            if ret_tgt is not None and "return_pred" in ep.columns:
-                rp   = ep["return_pred"].iloc[w]
-                rt   = ret_tgt.iloc[w]
-                mask = rp.notna() & rt.notna()
-                if mask.sum() >= min_obs:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        rho, _ = spearmanr(rp[mask], rt[mask])
-                    if not np.isnan(rho):
-                        score_ret = float(rho)
+            row_scores: List[float] = []
+            for name in self.model_names:
+                sig = signals.get(name)
+                if sig is None:
+                    row_scores.append(np.nan)
+                    continue
+                s_w  = sig.iloc[w]
+                mask = s_w.notna() & rt.notna()
+                if mask.sum() < min_obs:
+                    row_scores.append(np.nan)
+                    continue
+                row_scores.append(float((s_w[mask].values * rt[mask].values).mean()))
 
-            # vol: negative RMSE
-            score_vol = np.nan
-            if vol_tgt is not None and "vol_pred" in ep.columns:
-                vp   = ep["vol_pred"].iloc[w]
-                vt   = vol_tgt.iloc[w]
-                mask = vp.notna() & vt.notna()
-                if mask.sum() >= min_obs:
-                    score_vol = -float(
-                        np.sqrt(np.mean((vp[mask].values - vt[mask].values) ** 2))
-                    )
-
-            # regime: Spearman IC between regime_directional and forward return
-            # Mapping: 0 (bull) -> +1, 1 (bear) -> -1, 2 (sideways) -> 0
-            # Sideways days contribute zero signal but are NOT excluded from the
-            # window — they just get a neutral directional value of 0. This lets
-            # Spearman still compute over the full 21d window.
-            #
-            # Degenerate-window policy (0.0, NOT NaN):
-            #   All-sideways: reg_dir all 0  → constant → Spearman undefined.
-            #   All-same-dir: reg_dir all +1/-1 → constant → Spearman undefined.
-            #   Both cases score 0.0 ("regime adds no discriminative signal in
-            #   this window") so the row is retained in the proxy target.
-            #   This prevents ~215/354 val windows from being dropped by dropna().
-            score_reg = np.nan
-            if ret_tgt is not None and "regime_pred" in ep.columns:
-                rg      = ep["regime_pred"].iloc[w]
-                rt      = ret_tgt.iloc[w]
-                reg_dir = (rg == 0).astype(float) - (rg == 1).astype(float)
-                mask    = reg_dir.notna() & rt.notna()
-                if mask.sum() >= min_obs:
-                    if reg_dir[mask].nunique() > 1 and rt[mask].nunique() > 1:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore")
-                            rho, _ = spearmanr(reg_dir[mask], rt[mask])
-                        score_reg = float(rho) if not np.isnan(rho) else 0.0
-                    else:
-                        # Constant reg_dir (all-sideways or all-same-direction):
-                        # no informative signal in this window.
-                        score_reg = 0.0
-
-            # drawdown: negative Brier score (MSE between prob and binary label)
-            # Brier score = mean((p - y)^2). Negative so higher = better.
-            # Unlike log_loss, Brier score does NOT require both classes present
-            # in the window. This prevents ~151/354 val windows from dropping
-            # due to the 2022 persistent-bear period (all SPY_tgt_mdd_21d < -0.05
-            # in windows entirely within the bear regime → all-positive binary).
-            score_dd = np.nan
-            if mdd_tgt is not None and "drawdown_risk_prob" in ep.columns:
-                dp   = ep["drawdown_risk_prob"].iloc[w]
-                mt   = mdd_tgt.iloc[w]
-                mask = dp.notna() & mt.notna()
-                if mask.sum() >= min_obs:
-                    binary   = (mt[mask] < -0.05).astype(float)
-                    probs    = dp[mask].clip(1e-7, 1 - 1e-7).values
-                    score_dd = -float(np.mean((probs - binary.values) ** 2))
-
-            rows.append([score_ret, score_vol, score_reg, score_dd])
+            rows.append(row_scores)
 
         out = pd.DataFrame(rows, index=meta_features_df.index, columns=self.model_names)
-
-        # Drop rows with any NaN score (window edges, insufficient data)
         out = out.dropna()
 
-        # Z-score each column on the remaining (complete) rows
+        # Z-score each column so softmax operates on commensurable scales
         for col in out.columns:
             if out[col].std() > 0:
                 out[col] = (out[col] - out[col].mean()) / out[col].std()
 
         logger.info(
-            "build_proxy_target: {} complete rows returned (all 4 scores non-NaN, z-scored)",
+            "build_proxy_target: {} complete rows (unified directional PnL, z-scored)",
             len(out),
         )
         return out
@@ -313,14 +270,43 @@ class MetaLearner:
         """
         FIX 1: RidgeCV uses TimeSeriesSplit(n_splits, gap=cv_gap) to embargo
         the future_window autocorrelated label window from leaking into CV folds.
+
+        H3 fix: meta-features are StandardScaler-normalized before Ridge fit so
+        that scale differences across rolling_ic / rolling_pnl columns don't
+        inflate regularization pressure on small-magnitude columns.
+
+        After fitting, records self.saturated = {name: bool} where True means
+        the CV chose alpha = max(self.alphas) — indicating Ridge wanted more
+        regularization than the grid allows. predict_weights() zeros out the
+        raw scores for saturated models before softmax so they don't emit a
+        near-constant ~0.25 that dilutes the signal from the fitted models.
         """
+        # H3 fix: fit StandardScaler on X (train rows only — causal)
+        self._feature_scaler = StandardScaler()
+        X_scaled = self._feature_scaler.fit_transform(X.values)
+
         tscv = TimeSeriesSplit(n_splits=self.cv_splits, gap=self.cv_gap)
-        self.models = []
+        self.models   = []
+        self.saturated = {}
+        alpha_max = max(self.alphas)
         for col in self.model_names:
             m = RidgeCV(alphas=self.alphas, cv=tscv)
-            m.fit(X.values, y[col].values)
+            m.fit(X_scaled, y[col].values)
             self.models.append(m)
-            logger.info("train: model={} alpha_chosen={}", col, m.alpha_)
+            at_max = bool(m.alpha_ >= alpha_max)
+            self.saturated[col] = at_max
+            logger.info(
+                "train: model={}  alpha_chosen={}  {}",
+                col, m.alpha_, "SATURATED" if at_max else "interior",
+            )
+
+        n_sat = sum(self.saturated.values())
+        if n_sat > 0:
+            logger.warning(
+                "train: {}/{} models saturated at alpha={} — "
+                "consider widening the alpha grid further",
+                n_sat, len(self.model_names), alpha_max,
+            )
 
     # ------------------------------------------------------------------
     # Weight floor  (FIX 2: convex combination)
@@ -353,6 +339,13 @@ class MetaLearner:
         """
         Produce softmax + convex-floor weights for each row.
 
+        H3 fix:
+          - X is transformed with the StandardScaler fit during train().
+          - Saturated models (alpha == grid_max) have their raw score replaced
+            by 0.0 before softmax — this prevents a near-constant Ridge output
+            from polluting softmax with effectively-uniform contributions and
+            ensures the floor controls their final weight.
+
         Assertions (hard failures):
           - weights_df.sum(axis=1) == 1.0 within 1e-10.
           - weights_df.min(axis=1) >= weight_floor within 1e-10.
@@ -360,7 +353,23 @@ class MetaLearner:
         if self.models is None:
             raise RuntimeError("MetaLearner not trained — call train() first.")
 
-        raw_scores = np.column_stack([m.predict(X.values) for m in self.models])
+        # H3 fix: scale X with the train-fit scaler. v1 joblibs (no scaler) skip.
+        X_scaled = (
+            self._feature_scaler.transform(X.values)
+            if self._feature_scaler is not None
+            else X.values
+        )
+
+        raw_scores = np.column_stack([m.predict(X_scaled) for m in self.models])
+
+        # H3 fix: zero out raw scores for saturated models so softmax weights
+        # them by the floor only (no spurious variation from a near-constant
+        # over-regularized Ridge).
+        if self.saturated:
+            for i, name in enumerate(self.model_names):
+                if self.saturated.get(name, False):
+                    raw_scores[:, i] = 0.0
+
         sm         = softmax(raw_scores, axis=1)
         floored    = self._apply_weight_floor(sm)
 
@@ -386,12 +395,14 @@ class MetaLearner:
         """
         Meta-weighted signal vs equal-weight signal, annualized Sharpe.
 
-        Uses only return_pred and regime_pred for direction (vol_pred and
-        drawdown_risk_prob are risk signals, not directional).
+        Uses the unified 4-model directional combination (Option 3 redesign):
+          d_return   = +return_pred         (raw direction)
+          d_regime   = -regime_pred         (low z = bull → positive)
+          d_vol      = -vol_pred            (high vol = risk-off → negative)
+          d_drawdown = -drawdown_risk_prob  (high prob = risk-off → negative)
 
-          regime_directional: {0: +1, 1: -1, 2: 0}
-          meta_signal[t]  = w_return * return_pred + w_regime * regime_dir * |return_pred|
-          equal_signal[t] = 0.5 * return_pred + 0.5 * regime_dir * |return_pred|
+          meta_signal[t]  = sum_i  w_i[t] * d_i[t]
+          equal_signal[t] = sum_i  0.25  * d_i[t]
           pnl[t]          = signal[t-1] * actual_return[t]
           Sharpe          = mean(pnl) / std(pnl) * sqrt(252)
           lift_pct        = (meta_sharpe - equal_sharpe) / |equal_sharpe| * 100
@@ -401,16 +412,33 @@ class MetaLearner:
             logger.warning("evaluate_lift: {} not found in targets_df", target_col)
             return {}
 
-        actual_ret  = targets_df[target_col].reindex(weights_df.index)
-        ret_pred    = ep["return_pred"]
-        regime_pred = ep["regime_pred"]
-        regime_dir  = (regime_pred == 0).astype(float) - (regime_pred == 1).astype(float)
+        # Convention A (causal, realization-date indexed): pair signal[t-1]
+        # with log(close[t]/close[t-1]) = SPY_tgt_ret_1d[t-1]. SPY_tgt_ret_1d
+        # is forward-stamped, so .shift(1) converts forward → backward.
+        # Aligns with engine.feedback.step (live), build_proxy_target
+        # (training objective), and verify/evaluate_meta_lift.py (gate).
+        actual_ret = targets_df[target_col].shift(1).reindex(weights_df.index)
 
-        meta_signal  = (
-            weights_df["return"] * ret_pred
-            + weights_df["regime"] * regime_dir * ret_pred.abs()
+        # Per-model directional signals (consistent with build_proxy_target
+        # and engine.feedback.step)
+        d_return   =  ep["return_pred"]
+        d_vol      = -ep["vol_pred"]            if "vol_pred"           in ep else 0.0
+        d_regime   = -ep["regime_pred"]         if "regime_pred"        in ep else 0.0
+        d_drawdown = -ep["drawdown_risk_prob"]  if "drawdown_risk_prob" in ep else 0.0
+
+        # Risk-only signals are NaN before val (vol_pred warm-up, regime warm-up)
+        # — fillna(0) so they contribute zero (not NaN) to the weighted sum.
+        d_vol      = d_vol.fillna(0)      if hasattr(d_vol,    "fillna") else d_vol
+        d_regime   = d_regime.fillna(0)   if hasattr(d_regime, "fillna") else d_regime
+        d_drawdown = d_drawdown.fillna(0) if hasattr(d_drawdown, "fillna") else d_drawdown
+
+        meta_signal = (
+            weights_df["return"]   * d_return
+            + weights_df["vol"]      * d_vol
+            + weights_df["regime"]   * d_regime
+            + weights_df["drawdown"] * d_drawdown
         )
-        equal_signal = 0.5 * ret_pred + 0.5 * regime_dir * ret_pred.abs()
+        equal_signal = 0.25 * (d_return + d_vol + d_regime + d_drawdown)
 
         meta_pnl  = (meta_signal.shift(1)  * actual_ret).dropna()
         equal_pnl = (equal_signal.shift(1) * actual_ret).dropna()
@@ -473,12 +501,15 @@ class MetaLearner:
         p.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(
             {
-                "models":        self.models,
-                "feature_cols":  self.feature_cols,
-                "model_names":   self.model_names,
-                "weight_floor":  self.weight_floor,
-                "n_models":      self.n_models,
-                "future_window": self.future_window,
+                "models":          self.models,
+                "feature_cols":    self.feature_cols,
+                "model_names":     self.model_names,
+                "weight_floor":    self.weight_floor,
+                "n_models":        self.n_models,
+                "future_window":   self.future_window,
+                "alphas":          self.alphas,
+                "feature_scaler":  self._feature_scaler,
+                "saturated":       self.saturated,
             },
             p,
         )
@@ -489,12 +520,16 @@ class MetaLearner:
         if not p.is_absolute():
             p = PROJECT_ROOT / p
         d = joblib.load(p)
-        self.models        = d["models"]
-        self.feature_cols  = d["feature_cols"]
-        self.model_names   = d["model_names"]
-        self.weight_floor  = d["weight_floor"]
-        self.n_models      = d["n_models"]
-        self.future_window = d["future_window"]
+        self.models           = d["models"]
+        self.feature_cols     = d["feature_cols"]
+        self.model_names      = d["model_names"]
+        self.weight_floor     = d["weight_floor"]
+        self.n_models         = d["n_models"]
+        self.future_window    = d["future_window"]
+        # v2 fields — fall back to v1-compatible defaults if absent
+        self.alphas           = d.get("alphas", self.alphas)
+        self._feature_scaler  = d.get("feature_scaler", None)
+        self.saturated        = d.get("saturated", {})
         logger.info("MetaLearner loaded ← {}", p.relative_to(PROJECT_ROOT))
 
 

@@ -18,6 +18,23 @@ Column semantic directions (for downstream use)
   regime_pred        : 0=bull, 1=bear, 2=sideways (categorical, NOT risk-ordered)
   drawdown_risk_prob : [0, 1], +ve = high drawdown risk (risk-off)
 
+Prediction normalization
+------------------------
+  fit_normalizer(full_predictions_df, train_end) computes per-column mean/std
+  on the TRAIN period only (causal-safe). regime_pred is first risk-remapped
+  (bull=0, sideways=1, bear=2) before statistics are computed.
+
+  vol_pred has no train-period data (GARCH was fit only on val+test in Step 2.3).
+  Fallback: use the first ≤252 non-NaN rows of vol_pred for normalizer stats,
+  regardless of date.
+
+  After fitting, predict_all() calls normalize_predictions() which z-scores
+  each raw prediction using the stored stats. The normalized regime_pred is
+  a continuous z-score, no longer in {0, 1, 2}.
+
+  Normalizer stats are persisted to models/base/prediction_normalizer.joblib
+  so FeedbackLoopEngine can reload them without re-fitting.
+
 Disagreement metric
 -------------------
   Each column is standardised (zero mean, unit variance) using the VAL-period
@@ -25,7 +42,8 @@ Disagreement metric
   train because vol_forecasts.parquet does not cover the train period — GARCH
   was evaluated on val+test only in Step 2.3. Regime is remapped to a risk-ordered integer
   (bull=0, sideways=1, bear=2) for the disagreement computation only; the
-  regime_pred output column keeps its original HMM labeling.
+  regime_pred output column keeps its original HMM labeling (unless already
+  normalized, in which case the remap is skipped — see compute_disagreement guard).
 
   Row-wise std of the four standardised signals = disagreement score.
 
@@ -67,6 +85,13 @@ DRAWDOWN_MODEL_PATH = _MODEL_DIR / "drawdown_estimator.joblib"
 VOL_FORECASTS_PATH  = _PROCESSED_DIR / "vol_forecasts.parquet"
 REGIMES_PATH        = _PROCESSED_DIR / "regimes.parquet"
 OUTPUT_PATH         = _PROCESSED_DIR / "ensemble_predictions.parquet"
+_NORMALIZER_PATH    = _MODEL_DIR / "prediction_normalizer.joblib"
+
+# Risk-ordered remap for regime_pred: HMM labels 0=bull, 1=bear, 2=sideways
+# → risk-ordered 0=low risk (bull), 1=medium (sideways), 2=high risk (bear)
+_REGIME_RISK_MAP: Dict[float, float] = {0.0: 0.0, 2.0: 1.0, 1.0: 2.0}
+
+_PRED_COLS = ["return_pred", "vol_pred", "regime_pred", "drawdown_risk_prob"]
 
 
 def _load_config(path: Path = CONFIG_PATH) -> dict:
@@ -103,6 +128,16 @@ class BaseEnsemble:
         self._vol_df         = pd.read_parquet(VOL_FORECASTS_PATH)
         self._regime_df      = pd.read_parquet(REGIMES_PATH)
 
+        # Load normalizer stats if they exist (dict of {col: (mean, std)})
+        self._norm_stats: dict | None = None
+        if _NORMALIZER_PATH.exists():
+            self._norm_stats = joblib.load(_NORMALIZER_PATH)
+            logger.info(
+                "BaseEnsemble: loaded normalizer from {} (cols: {})",
+                _NORMALIZER_PATH.name,
+                list(self._norm_stats.keys()),
+            )
+
         logger.info(
             "BaseEnsemble loaded — return model: {}  drawdown model: {}  "
             "vol rows: {}  regime rows: {}",
@@ -111,6 +146,120 @@ class BaseEnsemble:
             len(self._vol_df),
             len(self._regime_df),
         )
+
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
+    def fit_normalizer(
+        self,
+        full_predictions_df: pd.DataFrame,
+        train_end: pd.Timestamp,
+    ) -> None:
+        """
+        Compute per-column mean/std on the TRAIN period and persist to disk.
+
+        regime_pred is risk-remapped before statistics are computed so the
+        normalizer operates on a monotone risk scale (0/1/2) not arbitrary
+        HMM labels.
+
+        vol_pred has no train-period coverage (GARCH fit on val+test only).
+        Fallback: use the first ≤252 non-NaN rows of vol_pred.
+
+        Parameters
+        ----------
+        full_predictions_df : pd.DataFrame
+            Output of predict_all() covering the full date range.
+        train_end : pd.Timestamp
+            Last inclusive date of the train period.
+        """
+        df = full_predictions_df.copy()
+
+        # Risk-remap regime before computing stats
+        if "regime_pred" in df.columns:
+            df["regime_pred"] = df["regime_pred"].map(_REGIME_RISK_MAP)
+
+        train_df = df.loc[df.index <= train_end]
+
+        norm_stats: dict = {}
+        for col in _PRED_COLS:
+            if col not in df.columns:
+                continue
+            if col == "vol_pred":
+                # vol_pred has no train data — fall back to first 252 non-NaN rows
+                available = df[col].dropna()
+                ref = available.iloc[:252] if len(available) >= 252 else available
+                if len(ref) == 0:
+                    logger.warning("fit_normalizer: vol_pred has no non-NaN rows — skip")
+                    continue
+                mu, sigma = float(ref.mean()), float(ref.std())
+                logger.info(
+                    "fit_normalizer: vol_pred fallback — {} rows (first non-NaN)",
+                    len(ref),
+                )
+            else:
+                col_data = train_df[col].dropna()
+                if len(col_data) < 20:
+                    logger.warning(
+                        "fit_normalizer: {} has only {} train rows — skip", col, len(col_data)
+                    )
+                    continue
+                mu, sigma = float(col_data.mean()), float(col_data.std())
+            if sigma == 0:
+                logger.warning("fit_normalizer: {} has zero std — skip", col)
+                continue
+            norm_stats[col] = (mu, sigma)
+            logger.info(
+                "fit_normalizer: {} → mean={:.6f}  std={:.6f}  n={}",
+                col, mu, sigma,
+                len(train_df[col].dropna()) if col != "vol_pred" else "fallback",
+            )
+
+        self._norm_stats = norm_stats
+        _NORMALIZER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(norm_stats, _NORMALIZER_PATH)
+        logger.info("Normalizer saved → {}", _NORMALIZER_PATH)
+
+    def normalize_predictions(self, preds_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Z-score each prediction column using the stored normalizer stats.
+
+        regime_pred is risk-remapped to {0, 1, 2} before z-scoring only if its
+        values are still raw HMM labels (subset of {0.0, 1.0, 2.0}); if already
+        normalized (continuous z-scores), the remap is skipped.
+
+        Parameters
+        ----------
+        preds_df : pd.DataFrame
+            Raw predictions (output of predict_all before normalization).
+
+        Returns
+        -------
+        pd.DataFrame with the same columns, each normalized.
+        Columns without normalizer stats are passed through unchanged.
+
+        Raises
+        ------
+        RuntimeError if fit_normalizer() has not been called (no stats loaded).
+        """
+        if self._norm_stats is None:
+            raise RuntimeError(
+                "normalize_predictions: no normalizer stats — call fit_normalizer() first "
+                "or ensure prediction_normalizer.joblib exists."
+            )
+
+        out = preds_df.copy()
+
+        # Risk-remap regime if still raw labels
+        if "regime_pred" in out.columns:
+            unique_vals = set(out["regime_pred"].dropna().unique())
+            if unique_vals.issubset({0.0, 1.0, 2.0}):
+                out["regime_pred"] = out["regime_pred"].map(_REGIME_RISK_MAP)
+
+        for col, (mu, sigma) in self._norm_stats.items():
+            if col in out.columns:
+                out[col] = (out[col] - mu) / sigma
+
+        return out
 
     # ------------------------------------------------------------------
     # Prediction
@@ -191,6 +340,10 @@ class BaseEnsemble:
                 nan_counts[nan_counts > 0].to_dict(),
             )
 
+        if self._norm_stats is not None:
+            predictions = self.normalize_predictions(predictions)
+            logger.debug("predict_all: predictions normalized")
+
         logger.info(
             "predict_all: {} rows  [{} → {}]",
             len(predictions),
@@ -245,9 +398,11 @@ class BaseEnsemble:
 
         # Risk-ordered regime remap: bull=0, sideways=1, bear=2
         # (original HMM labels: 0=bull, 1=bear, 2=sideways)
+        # Guard: skip remap if regime_pred is already normalized (z-scores, not {0,1,2})
         if "regime_pred" in df.columns:
-            regime_risk_order = {0: 0, 2: 1, 1: 2}
-            df["regime_pred"] = df["regime_pred"].map(regime_risk_order)
+            unique_vals = set(df["regime_pred"].dropna().unique())
+            if unique_vals.issubset({0.0, 1.0, 2.0}):
+                df["regime_pred"] = df["regime_pred"].map(_REGIME_RISK_MAP)
 
         scaler = StandardScaler()
         mask_complete = df.notna().all(axis=1)
@@ -367,15 +522,28 @@ if __name__ == "__main__":
         print(f"\nCannot build ensemble:\n{exc}")
         sys.exit(1)
 
+    from data.temporal_split import TemporalSplitter
+    splitter  = TemporalSplitter(cfg)
+    train_end = splitter.train_end
+    fit_start = splitter.train_next        # first business day after train_end
+    fit_end   = splitter.val_end if hasattr(splitter, "val_end") else splitter.test_start - pd.Timedelta(days=1)
+
+    # Produce raw (un-normalized) predictions first, then fit normalizer
+    # on train period so that predict_all() can normalize on the second call.
+    raw_predictions = ensemble.predict_all(X_price, X_joined)
+
+    logger.info(
+        "Fitting prediction normalizer on train period (up to {})",
+        train_end.date(),
+    )
+    ensemble.fit_normalizer(raw_predictions, train_end)
+
+    # Now predict_all() will auto-normalize (normalizer stats loaded in __init__)
     predictions = ensemble.predict_all(X_price, X_joined)
 
     # The disagreement scaler fits on the VAL period only — vol_forecasts
     # doesn't cover the train period (GARCH was only evaluated on val+test
     # in Step 2.3). Fitting on val avoids lookahead into test.
-    from data.temporal_split import TemporalSplitter
-    splitter  = TemporalSplitter(cfg)
-    fit_start = splitter.train_next        # first business day after train_end
-    fit_end   = splitter.val_end if hasattr(splitter, "val_end") else splitter.test_start - pd.Timedelta(days=1)
     logger.info(
         "Disagreement scaler fit window: [{}, {}] (val period)",
         fit_start.date(), pd.Timestamp(fit_end).date(),
